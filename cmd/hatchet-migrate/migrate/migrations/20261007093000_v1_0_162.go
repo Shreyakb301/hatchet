@@ -64,9 +64,10 @@ func downV10162(ctx context.Context, db *sql.DB) error {
 	}
 	defer conn.Close()
 
-	// Session settings would otherwise stay on the pooled connection for later migrations.
+	// lock_timeout would otherwise stay on the pooled connection for later migrations. statement_timeout stays 0,
+	// which is what migration connections start with; RESET would restore a role or database default instead.
 	defer func() {
-		if _, err := conn.ExecContext(context.Background(), `RESET statement_timeout; RESET lock_timeout;`); err != nil {
+		if _, err := conn.ExecContext(context.Background(), `RESET lock_timeout;`); err != nil {
 			log.Printf("v1_0_162: failed to reset session settings: %v", err)
 		}
 	}()

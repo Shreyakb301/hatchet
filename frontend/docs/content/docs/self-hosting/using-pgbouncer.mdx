@@ -14,16 +14,16 @@ To set this up, point the `DATABASE_PGBOUNCER_URL` environment variable at your 
 
 ## Statement timeouts
 
-Hatchet runs its queries with a 30 second `statement_timeout` and `idle_in_transaction_session_timeout`. It sets them when a connection opens. In transaction pooling mode, that only reaches one server connection, so most queries run without them. Hatchet logs a warning on startup when it detects this.
+Hatchet runs its queries with a 30 second `statement_timeout` and `idle_in_transaction_session_timeout`. It sets them when a connection opens. In transaction pooling mode, that only reaches one server connection, so most queries run without them. Hatchet logs a warning on startup when server connections start without one of these timeouts.
 
-To keep the timeouts, set them on the database role, for each Hatchet database:
+To keep the timeouts, set them on the role PgBouncer connects as, for each Hatchet database:
 
 ```sql
 ALTER ROLE <hatchet_user> IN DATABASE <database> SET statement_timeout = '30s';
 ALTER ROLE <hatchet_user> IN DATABASE <database> SET idle_in_transaction_session_timeout = '30s';
 ```
 
-New server connections pick up these defaults. Migrations turn both timeouts off on their own connections, so they aren't affected.
+New server connections pick up these defaults; run `RECONNECT` on the PgBouncer admin console, or restart PgBouncer, to replace existing ones. Migrations turn both timeouts off on their own connections, so they aren't affected. Other sessions with that role, such as `psql` or `pg_dump`, get the defaults too; run `SET statement_timeout = 0` in those sessions for long operations.
 
 On PgBouncer 1.26.0 or newer, you can instead add both settings to `track_extra_parameters` and append them to `DATABASE_PGBOUNCER_URL`, for example `?statement_timeout=30000&idle_in_transaction_session_timeout=30000`.
 

@@ -324,7 +324,9 @@ func (c *ConfigLoader) InitDataLayer() (res *database.Layer, err error) {
 		debug.Setup(pool)
 	}
 
-	warnIfTimeoutsDisabled(pool, &l)
+	if cf.PgBouncerURL != "" {
+		warnIfPgBouncerTimeoutsDisabled(config.ConnConfig, &l)
+	}
 
 	// a pool for read replicas, if enabled
 	var readReplicaPool *pgxpool.Pool
@@ -1333,74 +1335,61 @@ func checkDatabaseTimezone(connConfig *pgx.ConnConfig, dbName string, dbLabel st
 	return nil
 }
 
-const timeoutProbeConns = 4
-
-// warnIfTimeoutsDisabled logs a warning when pooled connections run without a statement or
-// idle-in-transaction timeout. All connections are acquired before any transaction starts, so
-// their AfterConnect SETs land before a transaction pooler has to serve the concurrent
-// transactions from different server connections.
-func warnIfTimeoutsDisabled(pool *pgxpool.Pool, l *zerolog.Logger) {
+// warnIfPgBouncerTimeoutsDisabled logs a warning when server connections behind PgBouncer start
+// without a statement or idle-in-transaction timeout. In transaction pooling mode, the AfterConnect
+// SETs reach only the server connection that served them, so the other server connections run with
+// their defaults. reset_val holds that default, for the role and database PgBouncer logs in with,
+// and SETs that other clients left on the server connection don't change it.
+func warnIfPgBouncerTimeoutsDisabled(connConfig *pgx.ConnConfig, l *zerolog.Logger) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	n := min(int32(timeoutProbeConns), pool.Config().MaxConns)
-	conns := make([]*pgxpool.Conn, 0, n)
+	conn, err := pgx.ConnectConfig(ctx, connConfig)
+	if err != nil {
+		l.Warn().Err(err).Msg("could not check database timeouts")
+		return
+	}
+	defer conn.Close(context.Background())
 
-	defer func() {
-		for _, conn := range conns {
-			conn.Release()
-		}
-	}()
-
-	for range n {
-		conn, err := pool.Acquire(ctx)
-		if err != nil {
-			l.Warn().Err(err).Msg("could not check database timeouts")
-			return
-		}
-
-		conns = append(conns, conn)
+	rows, err := conn.Query(
+		ctx,
+		"SELECT name, reset_val FROM pg_settings WHERE name IN ('statement_timeout', 'idle_in_transaction_session_timeout')",
+	)
+	if err != nil {
+		l.Warn().Err(err).Msg("could not check database timeouts")
+		return
 	}
 
-	txs := make([]pgx.Tx, 0, n)
+	var disabled []string
 
-	defer func() {
-		for _, tx := range txs {
-			_ = tx.Rollback(context.Background())
-		}
-	}()
+	for rows.Next() {
+		var name, resetVal string
 
-	disabled := 0
-
-	for _, conn := range conns {
-		tx, err := conn.Begin(ctx)
-		if err != nil {
+		if err := rows.Scan(&name, &resetVal); err != nil {
 			l.Warn().Err(err).Msg("could not check database timeouts")
 			return
 		}
 
-		txs = append(txs, tx)
-
-		var statementTimeout, idleInTxTimeout string
-
-		err = tx.QueryRow(
-			ctx,
-			"SELECT current_setting('statement_timeout'), current_setting('idle_in_transaction_session_timeout')",
-		).Scan(&statementTimeout, &idleInTxTimeout)
-		if err != nil {
-			l.Warn().Err(err).Msg("could not check database timeouts")
-			return
+		// PgBouncer applies parameters from the connection string (track_extra_parameters) on top of
+		// the server default.
+		if _, ok := connConfig.RuntimeParams[name]; ok {
+			continue
 		}
 
-		if statementTimeout == "0" || idleInTxTimeout == "0" {
-			disabled++
+		if resetVal == "0" {
+			disabled = append(disabled, name)
 		}
 	}
 
-	if disabled > 0 {
-		l.Warn().Int("disabled", disabled).Int32("checked", n).Msg(
-			"statement_timeout or idle_in_transaction_session_timeout is disabled on some database connections, " +
-				"see https://docs.hatchet.run/self-hosting/using-pgbouncer",
+	if err := rows.Err(); err != nil {
+		l.Warn().Err(err).Msg("could not check database timeouts")
+		return
+	}
+
+	if len(disabled) > 0 {
+		l.Warn().Strs("settings", disabled).Msg(
+			"database connections behind PgBouncer run without these timeouts, " +
+				"see https://docs.hatchet.run/self-hosting/using-pgbouncer#statement-timeouts",
 		)
 	}
 }
